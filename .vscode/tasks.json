@@ -57,6 +57,20 @@
 				"$platformio"
 			],
 			"group": "build"
+		},
+		{
+			"label": "Build GPS test firmware",
+			"type": "shell",
+			"command": "C:\\Users\\julian.COREROUTE\\.platformio\\penv\\Scripts\\platformio.exe",
+			"args": [
+				"run",
+				"-e",
+				"gps_test"
+			],
+			"problemMatcher": [
+				"$platformio"
+			],
+			"group": "build"
 		}
 	]
 }
