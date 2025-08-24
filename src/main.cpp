@@ -13,7 +13,20 @@ RTC_DATA_ATTR int32_t last_lon_i32 = 0;
 RTC_DATA_ATTR uint16_t last_alt_u16 = 0;
 RTC_DATA_ATTR bool last_pos_valid = false;
 
+// Last sent position (to compare movement)
+RTC_DATA_ATTR int32_t last_sent_lat_i32 = 0;
+RTC_DATA_ATTR int32_t last_sent_lon_i32 = 0;
+RTC_DATA_ATTR uint16_t last_sent_alt_u16 = 0;
+RTC_DATA_ATTR bool last_sent_valid = false;
+
 #define MINIMUM_DELAY 20 
+// Wake every 2 minutes (adjust to 60 for faster updates if needed)
+#define WAKE_INTERVAL_SECONDS 90
+// Min distance movement required for a new uplink (meters)
+#define POSITION_CHANGE_THRESHOLD_M 15.0
+// GPS acquisition time limits to avoid 10 min blocking (was 600000 ms for cold start)
+#define GPS_TIMEOUT_WARM_MS 30000UL   // 30s when we had a recent fix
+#define GPS_TIMEOUT_COLD_MS 60000UL   // 60s on cold start (instead of 600s) so we wake again sooner
 
 #include <Arduino.h>
 #include <stdint.h>
@@ -25,23 +38,31 @@ RTC_DATA_ATTR bool last_pos_valid = false;
 #include <cstdlib>
 #include <SSD1306Wire.h>
 
+// Faster GPS timeouts for higher reporting cadence
+#ifndef GPS_TIMEOUT_WARM_MS
+#define GPS_TIMEOUT_WARM_MS 20000UL
+#endif
+#ifndef GPS_TIMEOUT_COLD_MS
+#define GPS_TIMEOUT_COLD_MS 40000UL
+#endif
+
 
 // LoRaWAN OTAA credentials (fill with your actual values)
 // Note: Many networks still use LoRaWAN 1.0.x – in that case set NWK_KEY equal to APP_KEY.
 // Region/Band: set to your deployment (default EU868 below).
-static const uint64_t JOIN_EUI = 0x041613BF4582160AULL;   // a.k.a. AppEUI
-static const uint64_t DEV_EUI  = 0x8EEB7EFAB1CA76BFULL;
+static const uint64_t JOIN_EUI = 0x6EA284F73C6F34DAULL;   // a.k.a. AppEUI
+static const uint64_t DEV_EUI  = 0xA47057B5E0D0C582ULL;
 
 // C1DD1C023068DCDE2B46F137F19BE0BD
 static const uint8_t  APP_KEY[16] = { 
-  // 21513FC22D064439077E151EFE86BC19
-  0x21, 0x51, 0x3F, 0xC2, 0x2D, 0x06, 0x44, 0x39,
-  0x07, 0x7E, 0x15, 0x1E, 0xFE, 0x86, 0xBC, 0x19
+  // 33E407A1425F053D2D83173A0D814863
+  0x33, 0xE4, 0x07, 0xA1, 0x42, 0x5F, 0x05, 0x3D,
+  0x2D, 0x83, 0x17, 0x3A, 0x0D, 0x81, 0x48, 0x63
 };
 static const uint8_t  NWK_KEY[16] = { 
   // For LoRaWAN 1.0.x, set this identical to APP_KEY
-  0x21, 0x51, 0x3F, 0xC2, 0x2D, 0x06, 0x44, 0x39,
-  0x07, 0x7E, 0x15, 0x1E, 0xFE, 0x86, 0xBC, 0x19
+  0x33, 0xE4, 0x07, 0xA1, 0x42, 0x5F, 0x05, 0x3D,
+  0x2D, 0x83, 0x17, 0x3A, 0x0D, 0x81, 0x48, 0x63
 };
 
 LoRaWANNode* node;
@@ -53,6 +74,8 @@ static LoRaWANNode* makeNode() {
 }
 
 RTC_DATA_ATTR uint8_t count = 0;
+// Keep track of last uplink (epoch seconds) to enforce a max silent period
+RTC_DATA_ATTR uint32_t last_uplink_epoch = 0;
 
 // OLED (Heltec V3 onboard SSD1306 via I2C)
 #ifndef HELTEC_OLED_SDA
@@ -88,27 +111,46 @@ static void be_store_u16(uint8_t* buf, uint16_t v) {
   buf[1] = (uint8_t)(v & 0xFF);
 }
 
-void goToSleep() {
+// Haversine distance between two 1e5 scaled lat/lon pairs
+static double distanceMeters(int32_t lat1_i32, int32_t lon1_i32, int32_t lat2_i32, int32_t lon2_i32) {
+  if (lat1_i32 == lat2_i32 && lon1_i32 == lon2_i32) return 0.0;
+  const double kDegToRad = 0.017453292519943295; // PI/180
+  double lat1 = lat1_i32 / 1e5;
+  double lon1 = lon1_i32 / 1e5;
+  double lat2 = lat2_i32 / 1e5;
+  double lon2 = lon2_i32 / 1e5;
+  double dlat = (lat2 - lat1) * kDegToRad;
+  double dlon = (lon2 - lon1) * kDegToRad;
+  double a = sin(dlat/2)*sin(dlat/2) + cos(lat1*kDegToRad)*cos(lat2*kDegToRad)*sin(dlon/2)*sin(dlon/2);
+  double c = 2 * atan2(sqrt(a), sqrt(1-a));
+  return 6371000.0 * c;
+}
+
+static void goToSleepSeconds(uint32_t seconds) {
   Serial.println("Going to deep sleep now");
   persist.saveSession(node);
-  uint32_t interval = node->timeUntilUplink();
-  uint32_t delayMs = max(interval, (uint32_t)MINIMUM_DELAY * 1000);
-  Serial.printf("Next TX in %i s\n", delayMs/1000);
+  uint32_t dcMs = node ? node->timeUntilUplink() : 0;
+  uint32_t finalSec = max((uint32_t)MINIMUM_DELAY, max(seconds, dcMs/1000));
+  Serial.printf("Next wake in %u s (dutySuggest=%u ms)\n", (unsigned)finalSec, (unsigned)dcMs);
   delay(100);
-  heltec_deep_sleep(delayMs/1000);
+  heltec_deep_sleep(finalSec);
 }
+
+void goToSleep() { goToSleepSeconds(WAKE_INTERVAL_SECONDS); }
  
 void setup() {
   heltec_setup();
+  heltec_ve(true);
   // Init OLED
   display.init();
   display.clear();
   display.display();
   oledShow("TTN APRS Tracker", "Booting...", "");
   // Initialize BN-220 GPS UART
-  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  // Set RX buffer size BEFORE begin() (esp32 HardwareSerial limitation)
   GPSSerial.setRxBufferSize(1024);
-  Serial.printf("BN-220 GPS UART started on RX=%d TX=%d at 9600 baud\n", GPS_RX_PIN, GPS_TX_PIN);
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("BN-220 GPS UART started on RX=%d TX=%d at 9600 baud (rxbuf=1024)\n", GPS_RX_PIN, GPS_TX_PIN);
 
   // Obtain directly after deep sleep
   // May or may not reflect room temperature, sort of. 
@@ -119,9 +161,16 @@ void setup() {
   Serial.println("Radio init");
   int16_t state = radio.begin();
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.println("Radio did not initialize. We'll try again later.");
-  oledShow("Radio init FAIL", "Sleep & retry", "");
-    goToSleep();
+    Serial.println("Radio init failed, retrying...");
+    delay(200);
+    state = radio.begin();
+    if (state != RADIOLIB_ERR_NONE) {
+      Serial.println("Radio failed again, sleeping.");
+      oledShow("Radio FAIL", "Sleep & retry", "");
+      goToSleep();
+    } else {
+      oledShow("Radio OK 2nd", "", "");
+    }
   }
 
   // Create node for selected band and try to restore session (deep sleep)
@@ -137,24 +186,30 @@ void setup() {
   oledShow("Join setup FAIL", "Sleep & retry", "");
       goToSleep();
     }
-    // Try a few times with a reasonable join DR (e.g., SF9/DR3 in EU868)
+    // Multi-DR join attempts: start mid (DR3 ~ SF9) then go slower for reach, then faster
+    const uint8_t joinDRs[] = {3, 2, 1, 0}; // EU868: DR3=SF9 .. DR0=SF12
     int16_t joinRes = -1;
-    // DR index depends on band; for EU868, DR3 ~ SF9/125kHz
-    const uint8_t JOIN_DR = 3;
-    for (int i = 0; i < 3; ++i) {
-      joinRes = node->activateOTAA(JOIN_DR);
-      if (joinRes == RADIOLIB_LORAWAN_NEW_SESSION || joinRes == RADIOLIB_LORAWAN_SESSION_RESTORED) {
-        Serial.printf("activateOTAA success (%s)\n", joinRes == RADIOLIB_LORAWAN_NEW_SESSION ? "new session" : "restored session");
-        oledShow("LoRaWAN: Joined", "EU868 OTAA", "");
-        break;
+    bool joined = false;
+    for (size_t d = 0; d < sizeof(joinDRs); ++d) {
+      uint8_t dr = joinDRs[d];
+      for (int attempt = 1; attempt <= 2; ++attempt) { // two tries per DR
+        Serial.printf("OTAA join attempt DR%d try %d/2...\n", dr, attempt);
+        oledShow("Joining", (String("DR") + dr).c_str(), (String("try ") + attempt).c_str());
+        joinRes = node->activateOTAA(dr);
+        if (joinRes == RADIOLIB_LORAWAN_NEW_SESSION || joinRes == RADIOLIB_LORAWAN_SESSION_RESTORED) {
+          Serial.printf("activateOTAA success (%s) on DR%d\n", joinRes == RADIOLIB_LORAWAN_NEW_SESSION ? "new session" : "restored session", dr);
+          oledShow("LoRaWAN: Joined", (String("DR") + dr).c_str(), "EU868");
+          joined = true;
+          break;
+        }
+        Serial.printf("activateOTAA failed: %d on DR%d (attempt %d)\n", joinRes, dr, attempt);
+        delay(1800); // small pause between attempts
       }
-      Serial.printf("activateOTAA failed: %d (try %d/3)\n", joinRes, i+1);
-      oledShow("Joining...", "retrying", "");
-      delay(2000);
+      if (joined) break;
     }
-    if (!(joinRes == RADIOLIB_LORAWAN_NEW_SESSION || joinRes == RADIOLIB_ERR_NONE)) {
-      Serial.printf("activateOTAA failed: %d, will retry later.\n", joinRes);
-      oledShow("Join FAIL", "Sleep & retry", "");
+    if (!joined) {
+      Serial.printf("All OTAA attempts failed, last error=%d. Suggest: check keys/endian, remove device in TTN to reset DevNonce list. Sleeping.\n", joinRes);
+      oledShow("Join FAIL", "Check keys", String(joinRes).c_str());
       goToSleep();
     }
   // Save session immediately to persist nonces and session state
@@ -173,7 +228,8 @@ void setup() {
   double lat = 0, lon = 0, alt_m = 0;
   uint32_t tStart = millis();
   bool gotFix = false;
-  const uint32_t gpsTimeoutMs = (last_pos_valid ? 45000u : 600000u); // 45s warm, 600s cold
+  const uint32_t gpsTimeoutMs = (last_pos_valid ? GPS_TIMEOUT_WARM_MS : GPS_TIMEOUT_COLD_MS);
+  Serial.printf("GPS timeout this wake: %lus (%s)\n", (unsigned)(gpsTimeoutMs/1000), last_pos_valid?"warm":"cold");
   uint32_t lastStatus = 0;
   size_t bytesSeen = 0;
   // Peek at occasional NMEA to confirm valid sentences are coming in
@@ -256,6 +312,13 @@ void setup() {
     lat_i32 = (int32_t)round(lat * 1e5);
     lon_i32 = (int32_t)round(lon * 1e5);
     alt_u16 = (alt_m < 0) ? 0 : (uint16_t)round(alt_m);
+    if (lat_i32 == 0 && lon_i32 == 0 && last_pos_valid) { // discard implausible 0/0
+      Serial.println("Discarding (0,0) fix; using last position");
+      lat_i32 = last_lat_i32;
+      lon_i32 = last_lon_i32;
+      alt_u16 = last_alt_u16;
+      gotFix = false; // treat as not a new fix
+    }
     last_lat_i32 = lat_i32;
     last_lon_i32 = lon_i32;
     last_alt_u16 = alt_u16;
@@ -294,28 +357,67 @@ void setup() {
     (lon_i32 >> 24) & 0xFF, (lon_i32 >> 16) & 0xFF, (lon_i32 >> 8) & 0xFF, lon_i32 & 0xFF,
     (alt_u16 >> 8) & 0xFF, alt_u16 & 0xFF);
 
-  uint8_t uplinkData[10];
-  be_store_i32(&uplinkData[0], lat_i32);
-  be_store_i32(&uplinkData[4], lon_i32);
-  be_store_u16(&uplinkData[8], alt_u16);
-
-  uint8_t downlinkData[256];
-  size_t lenDown = sizeof(downlinkData);
-
-  state = node->sendReceive(uplinkData, sizeof(uplinkData), 1, downlinkData, &lenDown);
-
-  if(state == RADIOLIB_ERR_NONE) {
-    Serial.println("Message sent, no downlink received.");
-  oledShow("Uplink sent", "No downlink", "");
-  } else if (state > 0) {
-    Serial.println("Message sent, downlink received.");
-  oledShow("Uplink sent", "Downlink rx", "");
+  // Decide whether to send based on movement threshold
+  bool sendNow = false;
+  double moveDist = 0.0;
+  if (!last_sent_valid) {
+    sendNow = true; // first ever
+    Serial.println("No previous sent pos -> will send");
   } else {
-    Serial.printf("sendReceive returned error %d, we'll try again later.\n", state);
-  oledShow("Uplink error", "Sleep & retry", "");
+    moveDist = distanceMeters(last_sent_lat_i32, last_sent_lon_i32, lat_i32, lon_i32);
+  Serial.printf("Distance since last uplink: %.2fm (threshold %.2fm)\n", moveDist, (double)POSITION_CHANGE_THRESHOLD_M);
+    if (moveDist >= POSITION_CHANGE_THRESHOLD_M) {
+      sendNow = true;
+      Serial.printf("Moved %.1fm >= %.1fm -> send\n", moveDist, POSITION_CHANGE_THRESHOLD_M);
+    } else {
+      Serial.printf("Moved only %.1fm (<%.1fm) -> skip uplink\n", moveDist, POSITION_CHANGE_THRESHOLD_M);
+    }
   }
 
-  goToSleep();    // Does not return, program starts over next round
+  if (sendNow) {
+    uint8_t uplinkData[10];
+    be_store_i32(&uplinkData[0], lat_i32);
+    be_store_i32(&uplinkData[4], lon_i32);
+    be_store_u16(&uplinkData[8], alt_u16);
+    uint8_t downlinkData[256];
+    size_t lenDown = sizeof(downlinkData);
+    state = node->sendReceive(uplinkData, sizeof(uplinkData), 1, downlinkData, &lenDown);
+    if (state == RADIOLIB_ERR_NONE) {
+      Serial.println("Uplink OK (no DL)");
+      oledShow("Uplink OK", "No DL", "");
+      last_sent_lat_i32 = lat_i32;
+      last_sent_lon_i32 = lon_i32;
+      last_sent_alt_u16 = alt_u16;
+      last_sent_valid = true;
+    } else if (state > 0) {
+      Serial.println("Uplink OK (DL)");
+      oledShow("Uplink OK", "DL recv", "");
+      last_sent_lat_i32 = lat_i32;
+      last_sent_lon_i32 = lon_i32;
+      last_sent_alt_u16 = alt_u16;
+      last_sent_valid = true;
+    } else {
+      Serial.printf("Uplink error %d\n", state);
+      oledShow("Uplink ERR", String(state).c_str(), "");
+    }
+  } else {
+    // Enforce a periodic heartbeat (e.g. every 10 min) even without movement
+    uint32_t nowEpoch = millis()/1000; // coarse (resets after deep sleep but acceptable for spacing)
+    const uint32_t HEARTBEAT_SEC = 600; // 10 minutes
+    if (!last_sent_valid || (nowEpoch - last_uplink_epoch) >= HEARTBEAT_SEC) {
+      Serial.println("Heartbeat uplink (no movement but max interval reached)");
+      sendNow = true; // fall through to send path by re-running logic
+    } else {
+      char l1[24], l2[24], l3[24];
+      snprintf(l1, sizeof(l1), "No move <%.0fm", POSITION_CHANGE_THRESHOLD_M);
+      snprintf(l2, sizeof(l2), "d=%.1fm", moveDist);
+      snprintf(l3, sizeof(l3), "Sleep %us", WAKE_INTERVAL_SECONDS);
+      oledShow(l1, l2, l3);
+    }
+  }
+
+
+  goToSleep();
 
 }
 
