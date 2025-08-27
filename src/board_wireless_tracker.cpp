@@ -52,4 +52,23 @@ void boardDisplayPreUIInit() {
 #endif
 }
 
+long boardGpsInit(HardwareSerial &serial) {
+  serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("[GPS] WT RX=%d TX=%d baud=%lu (fixed)\n", GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
+  // Kurzer Probe-Read
+  uint32_t t0 = millis(); size_t bytes=0; size_t nonZero=0;
+  while (millis() - t0 < 500) {
+    while (serial.available()) { uint8_t c = serial.read(); bytes++; if (c>0 && c<128) nonZero++; if (bytes>200) break; }
+    if (bytes>200) break; delay(5);
+  }
+  Serial.printf("[GPS] initial bytes=%u printable=%u\n", (unsigned)bytes, (unsigned)nonZero);
+  if (bytes == 0) {
+    Serial.println("[GPS] no bytes -> send wake/config hint");
+    const char *cfg = "$CFGSYS,h35155*68\r\n";
+    serial.write((const uint8_t*)cfg, strlen(cfg));
+    delay(120);
+  }
+  return (long)GPS_BAUD;
+}
+
 #endif

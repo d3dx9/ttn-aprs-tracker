@@ -56,4 +56,31 @@ void boardDisplayPreUIInit() {
   // OLED braucht hier nichts; uiInit erledigt Init
 }
 
+long boardGpsInit(HardwareSerial &serial) {
+  // Auto-Baud Erkennung ähnlich bisherigem Code
+  const long baseBaud = (long)GPS_BAUD;
+  const long probeList[] = { baseBaud, 9600, 38400, 57600, 115200 };
+  long useBaud = baseBaud;
+  auto probeBaud = [&](long b)->bool {
+    serial.end(); delay(30);
+    serial.begin(b, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    uint32_t t0 = millis(); int dollars=0; int letters=0; char last='?';
+    while (millis() - t0 < 600) {
+      while (serial.available()) {
+        char c = (char)serial.read();
+        if (c == '$') { dollars++; last = '$'; }
+        else if (last=='$') { if (isAlpha(c)) letters++; last='x'; }
+        if (dollars >= 2 && letters >= 2) return true;
+      }
+      delay(5);
+    }
+    return false;
+  };
+  bool detected=false;
+  for (long b : probeList) { if (probeBaud(b)) { useBaud = b; detected=true; break; } }
+  if (!detected) { serial.end(); serial.begin(baseBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN); }
+  Serial.printf("[GPS] V3 RX=%d TX=%d baud=%ld (auto=%s)\n", GPS_RX_PIN, GPS_TX_PIN, useBaud, detected?"yes":"no");
+  return useBaud;
+}
+
 #endif // DEVICE_HELTEC_LORA32_V3

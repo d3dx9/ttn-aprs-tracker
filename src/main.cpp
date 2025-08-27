@@ -18,6 +18,7 @@
 #endif
 #ifdef ARDUINO_ARCH_ESP32
 #include "driver/rtc_io.h"
+#include <nvs_flash.h>
 #endif
 
 
@@ -87,6 +88,19 @@ RTC_DATA_ATTR uint16_t last_sent_alt_u16 = 0;
 RTC_DATA_ATTR bool last_sent_valid = false;
 RTC_DATA_ATTR uint32_t last_uplink_epoch = 0; // sek seit Boot (coarse)
 RTC_DATA_ATTR uint32_t wake_counter = 0;
+// Merken ob Boot-Logo schon einmal gezeigt wurde (DeepSleep-überdauernd via RTC RAM)
+RTC_DATA_ATTR bool boot_logo_shown = false;
+
+// Optional: festen LoRaWAN DataRate (Spreading Factor) erzwingen.
+// EU868 Zuordnung: DR0=SF12, DR1=SF11, DR2=SF10, DR3=SF9, DR4=SF8, DR5=SF7 (alle 125kHz)
+// Standard hier: DR3 (SF9) – anpassen per Build-Flag: -DFIXED_LORAWAN_DR=5 z.B. für SF7
+#ifndef FIXED_LORAWAN_DR
+#define FIXED_LORAWAN_DR 3
+#endif
+// Schalter ob wir den festen DR erzwingen wollen.
+#ifndef FORCE_FIXED_DR
+#define FORCE_FIXED_DR 1
+#endif
 
 // ------------------- Objekte --------------------
 HardwareSerial GPSSerial(1);
@@ -154,6 +168,19 @@ static void initSerial() {
 
 void setup() {
   initSerial();
+  // NVS init (for persistence flash storage)
+#ifdef ARDUINO_ARCH_ESP32
+  esp_err_t nvsr = nvs_flash_init();
+  if (nvsr != ESP_OK) {
+    Serial.printf("[NVS] init err=%d -> erase & re-init\n", (int)nvsr);
+    if (nvsr == ESP_ERR_NVS_NO_FREE_PAGES || nvsr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      nvs_flash_erase();
+      nvsr = nvs_flash_init();
+    }
+  }
+  Serial.printf("[NVS] status=%d\n", (int)nvsr);
+#endif
+  Serial.printf("[RTC] wake_counter=%lu boot_logo_shown=%d last_sent_valid=%d\n", (unsigned long)wake_counter+1, boot_logo_shown?1:0, last_sent_valid?1:0);
   logInfo("[BOOT] Setup start");
   // Board-spezifische frühe Initialisierung (Power Rails, I2C, Reset etc.)
   boardEarlyInit();
@@ -173,7 +200,10 @@ void setup() {
   STAGE(4,"before_uiInit");
   boardDisplayPreUIInit();
   uiInit();
-  uiShowBootLogo();
+  if (!boot_logo_shown) { // Logo nur beim allerersten Boot zeigen
+    uiShowBootLogo();
+    boot_logo_shown = true;
+  }
   STAGE(5,"after_uiInit");
 #endif
   {
@@ -217,107 +247,68 @@ void setup() {
   Serial.println("Radio OK");
   uiPrintLines("Radio OK", "Session load...");
 
-  // LoRaWAN Node anlegen und Session laden
-  static LoRaWANNode localNode(&radio, &EU868, 0);
-  node = &localNode;
-  bool restored = persist.loadSession(node);
-  Serial.printf("Session restored=%d activated=%d\n", restored?1:0, node->isActivated()?1:0);
-  if (!restored || !node->isActivated()) {
-    node->setADR(false);
-  int16_t st = node->beginOTAA(JOIN_EUI, DEV_EUI, NWK_KEY, APP_KEY);
-    if (st != RADIOLIB_ERR_NONE) {
-      Serial.printf("beginOTAA setup failed %d -> sleep\n", st);
-      {
-        String s = String(st);
-  uiPrintLines("OTAA setup FAIL", s.c_str());
-      }
-      deepSleepSeconds(WAKE_INTERVAL_SECONDS);
-    }
-    const uint8_t joinDRs[] = {3,2,1,0};
-    bool joined = false; int16_t jr = 0;
-    for (uint8_t dr: joinDRs) {
-      for (int attempt=1; attempt<=2; ++attempt) {
-        Serial.printf("Join DR%d attempt %d/2...\n", dr, attempt);
-        char line2[20]; snprintf(line2, sizeof(line2), "DR%d try %d", dr, attempt);
-  uiPrintLines("Joining", line2);
-        jr = node->activateOTAA(dr);
-        if (jr == RADIOLIB_LORAWAN_NEW_SESSION || jr == RADIOLIB_LORAWAN_SESSION_RESTORED) { joined=true; break; }
-        delay(1500);
-      }
-      if (joined) break;
-    }
-    if (!joined) {
-      Serial.printf("Join failed last=%d -> sleep\n", jr);
-      {
-        String s = String(jr);
-  uiPrintLines("Join FAIL", s.c_str());
-      }
-      deepSleepSeconds(WAKE_INTERVAL_SECONDS);
-    }
-    persist.saveSession(node);
+  // Provision falls nötig und manage() für automatisches Laden/Join
+  bool prov = persist.isProvisioned();
+  if (!prov) {
+    Serial.println("[LWN] Not provisioned -> provisioning from constants");
+    // Speichere feste Keys einmalig in Flash
+    bool pOK = persist.provision("EU868", 0, JOIN_EUI, DEV_EUI, APP_KEY, NWK_KEY);
+    Serial.printf("[LWN] provision result=%d\n", pOK?1:0);
   } else {
-    Serial.println("Session OK (restored)" );
-  uiPrintLines("Session restored");
+    Serial.println("[LWN] Already provisioned");
   }
+  node = persist.manage(&radio, false); // false = nicht automatisch joinen (wir steuern unten)
+  if (!node) {
+    uiPrintLines("Node alloc FAIL");
+    Serial.println("[ERR] manage() returned nullptr");
+    deepSleepSeconds(WAKE_INTERVAL_SECONDS);
+  }
+  // loadSession wurde bereits einmal von manage() aufgerufen. NICHT erneut aufrufen (bootcount!).
+  Serial.printf("[LWN] post-manage activated=%d (session buffers restored=%s)\n", node->isActivated()?1:0, "unknown");
+  // Falls Activation-Flag noch nicht gesetzt: ein einzelner activateOTAA() Versuch mit FIXED_LORAWAN_DR.
+  // RadioLib wird dabei entweder die vorhandene Session als restored erkennen oder eine neue Join-Prozedur starten.
+  if (!node->isActivated()) {
+    node->setADR(false);
+    Serial.printf("[LWN] activateOTAA attempt DR%d (restore-or-join)\n", (int)FIXED_LORAWAN_DR);
+    uiPrintLines("Join", (String("DR")+FIXED_LORAWAN_DR).c_str());
+    int16_t jr = node->activateOTAA(FIXED_LORAWAN_DR);
+    Serial.printf("[LWN] activateOTAA result code=%d activated=%d\n", jr, node->isActivated()?1:0);
+    if (!node->isActivated()) {
+      // Kein Erfolg -> Retry mit wenigen alternativen DRs (Fallback)
+      const uint8_t fallbackDRs[] = { 3,2,1,0 };
+      for (uint8_t dr : fallbackDRs) {
+        if (dr == FIXED_LORAWAN_DR) continue; // bereits versucht
+        Serial.printf("[LWN] Fallback join DR%d\n", dr);
+        uiPrintLines("Join", (String("DR")+dr).c_str());
+        jr = node->activateOTAA(dr);
+        Serial.printf("[LWN] result code=%d activated=%d\n", jr, node->isActivated()?1:0);
+        if (node->isActivated()) break;
+        delay(1400);
+      }
+    }
+    if (!node->isActivated()) {
+      Serial.println("[LWN] Join failed -> sleep");
+      uiPrintLines("Join FAIL");
+      deepSleepSeconds(WAKE_INTERVAL_SECONDS);
+    } else {
+      uiPrintLines("Join OK");
+      persist.saveSession(node); // neue oder restaurierte Session sichern
+    }
+  }
+  // Feste DR ggf. setzen
+  #if FORCE_FIXED_DR
+    node->setADR(false);
+    int16_t drRes = node->setDatarate(FIXED_LORAWAN_DR);
+    Serial.printf("[LWN] enforce DR%d res=%d\n", FIXED_LORAWAN_DR, drRes);
+  #endif
 
   // Makro-Pflicht: DutyCycle aktivieren (FUP einhalten)
   node->setDutyCycle(true, 1250); // ca. 1% max airtime
 
-  // GPS starten (Board-spezifisch): V3 -> AutoDetect; Wireless Tracker -> feste Baud + optional Init
+  // GPS starten über Board-Abstraktion
   GPSSerial.setRxBufferSize(1024);
-#if defined(DEVICE_HELTEC_LORA32_V3)
-  {
-    const long baseBaud = (long)GPS_BAUD;
-    const long probeList[] = { baseBaud, 9600, 38400, 57600, 115200 };
-    long useBaud = baseBaud;
-    auto probeBaud = [&](long b)->bool {
-      GPSSerial.end(); delay(30);
-      GPSSerial.begin(b, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-      uint32_t t0 = millis(); int dollars=0; int letters=0; char last='?';
-      while (millis() - t0 < 600) { // etwas länger
-        while (GPSSerial.available()) {
-          char c = (char)GPSSerial.read();
-          if (c == '$') { dollars++; last = '$'; }
-          else if (last=='$') { if (isAlpha(c)) letters++; last='x'; }
-          if (dollars >= 2 && letters >= 2) return true;
-        }
-        delay(5);
-      }
-      return false;
-    };
-    bool detected=false;
-    for (long b : probeList) {
-      if (probeBaud(b)) { useBaud = b; detected=true; break; }
-    }
-    if (!detected) {
-      GPSSerial.end(); GPSSerial.begin(baseBaud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    }
-    Serial.printf("[GPS] V3 RX=%d TX=%d baud=%ld (auto=%s)\n", GPS_RX_PIN, GPS_TX_PIN, useBaud, detected?"yes":"no");
-  }
-#elif defined(DEVICE_HELTEC_WIRELESS_TRACKER)
-  {
-    // Bekannte Default-Konfiguration: 115200 Baud, GNSS Power bereits aktiv (VGNSS_CTRL)
-    GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.printf("[GPS] WT RX=%d TX=%d baud=%lu (fixed)\n", GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
-    // Kurzer Probe-Read um zu sehen ob Bytes ankommen
-    uint32_t t0 = millis(); size_t bytes=0; size_t nonZero=0; int sample=0; 
-    while (millis() - t0 < 500) {
-      while (GPSSerial.available()) {
-        uint8_t c = GPSSerial.read(); bytes++; if (c>0 && c<128) nonZero++; if (bytes>200) break; }
-      if (bytes>200) break; delay(5);
-    }
-    Serial.printf("[GPS] initial bytes=%u printable=%u\n", (unsigned)bytes, (unsigned)nonZero);
-    if (bytes == 0) {
-      Serial.println("[GPS] no bytes -> send wake/config + wiring hint (swap RX/TX if persists)");
-      const char *cfg = "$CFGSYS,h35155*68\r\n"; // aus Referenzprojekt
-      GPSSerial.write((const uint8_t*)cfg, strlen(cfg));
-      delay(120);
-    }
-  }
-#else
-  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.printf("[GPS] Generic RX=%d TX=%d baud=%lu\n", GPS_RX_PIN, GPS_TX_PIN, (unsigned long)GPS_BAUD);
-#endif
+  long gpsBaud = boardGpsInit(GPSSerial);
+  (void)gpsBaud;
 #ifdef GNSS_RST
   pinMode(GNSS_RST, OUTPUT);
   digitalWrite(GNSS_RST, LOW); delay(5); digitalWrite(GNSS_RST, HIGH);
@@ -379,7 +370,7 @@ void setup() {
   }
   Serial.printf("GPS summary: bytes=%u NMEA=%u GGA=%u RMC=%u GSV=%u\n", (unsigned)bytesRead, (unsigned)nmeaCount, (unsigned)nmeaGGA, (unsigned)nmeaRMC, (unsigned)nmeaGSV);
 
-  int32_t lat_i32, lon_i32; uint16_t alt_u16; bool simulatedPos = false;
+  int32_t lat_i32 = 0, lon_i32 = 0; uint16_t alt_u16 = 0; bool hasPosition = false;
   if (gotFix) {
     lat_i32 = (int32_t)llround(lat * 1e5);
     lon_i32 = (int32_t)llround(lon * 1e5);
@@ -389,46 +380,38 @@ void setup() {
     }
     last_lat_i32 = lat_i32; last_lon_i32 = lon_i32; last_alt_u16 = alt_u16; last_pos_valid = true;
     Serial.printf("GPS FIX lat=%.6f lon=%.6f alt=%.1f\n", lat, lon, alt);
-  char l1[24]; char l2[24]; snprintf(l1, sizeof(l1), "LAT %.5f", lat); snprintf(l2, sizeof(l2), "LON %.5f", lon);
-  uiPrintLines("GPS FIX", l1, l2);
+    char l1[24]; char l2[24]; snprintf(l1, sizeof(l1), "LAT %.5f", lat); snprintf(l2, sizeof(l2), "LON %.5f", lon);
+    uiPrintLines("GPS FIX", l1, l2);
+    hasPosition = true;
   } else if (last_pos_valid) {
     lat_i32 = last_lat_i32; lon_i32 = last_lon_i32; alt_u16 = last_alt_u16;
     Serial.println("No new fix -> using last position");
-  uiPrintLines("GPS no new fix");
+    uiPrintLines("GPS no new fix");
+    hasPosition = true;
   } else {
-    // einfache Simulation (nur erstes Mal ohne Fix) -> NICHT senden
-    static RTC_DATA_ATTR double sim_lat = 47.000100;
-    static RTC_DATA_ATTR double sim_lon = 8.000100;
-    static RTC_DATA_ATTR double sim_alt = 400.0;
-    sim_lat += 0.00005; sim_lon += 0.00004; sim_alt += ((wake_counter % 2)?1:-1);
-    lat_i32 = (int32_t)llround(sim_lat * 1e5);
-    lon_i32 = (int32_t)llround(sim_lon * 1e5);
-    alt_u16 = (uint16_t)llround(sim_alt);
-    // NICHT last_pos_valid setzen, damit beim nächsten Wake wieder als "cold" versucht wird
-    simulatedPos = true;
-    Serial.printf("Simulated position lat=%.6f lon=%.6f alt=%.1f (WILL NOT BE SENT)\n", sim_lat, sim_lon, sim_alt);
-  uiPrintLines("GPS sim", "no real fix", "skip uplink");
+    // Kein Fix und keine letzte Position -> diesmal kein Uplink
+    Serial.println("No GPS fix yet (first run) -> skip uplink");
+    uiPrintLines("GPS no fix", "skip uplink");
   }
 
   // (c) Immer senden: Standortänderung oder Heartbeat werden ignoriert.
   // Hinweis: Duty-Cycle Begrenzungen werden vom Stack gehandhabt; Send kann ggf. fehlschlagen.
-  bool sendNow = true;
-  if (simulatedPos) {
-    sendNow = false; // niemals simulierte Koordinaten senden
-  }
-  if (!last_sent_valid) {
-    Serial.println("First uplink (forced)");
-  uiPrintLines("Uplink", "first");
-  } else {
-    Serial.println("Force uplink (each wake)");
-  uiPrintLines("Uplink", "forced");
+  bool sendNow = hasPosition; // nur senden wenn echte oder letzte gültige Position vorhanden
+  if (sendNow) {
+    if (!last_sent_valid) {
+      Serial.println("First uplink (forced)");
+      uiPrintLines("Uplink", "first");
+    } else {
+      Serial.println("Force uplink (each wake)");
+      uiPrintLines("Uplink", "forced");
+    }
   }
 
   if (sendNow) {
     uint8_t payload[10];
     be_store_i32(&payload[0], lat_i32);
     be_store_i32(&payload[4], lon_i32);
-    be_store_u16(&payload[8], (uint16_t)last_alt_u16);
+  be_store_u16(&payload[8], alt_u16);
     uint8_t dlBuf[64]; size_t dlLen = sizeof(dlBuf);
   // Vor jedem Senden erneut gewünschte Leistung setzen (falls Stack oder ADR sie verändert hat)
   int setPwr2 = LORAWAN_TX_POWER_DBM; if (setPwr2 > 22) setPwr2 = 22; if (setPwr2 < -9) setPwr2 = -9;
@@ -436,7 +419,7 @@ void setup() {
   int16_t st = node->sendReceive(payload, sizeof(payload), 1, dlBuf, &dlLen);
     if (st >= 0) {
       Serial.printf("Uplink OK (state=%d, DLlen=%u)\n", st, (unsigned)dlLen);
-  uiPrintLines("Uplink OK", dlLen?"DL":"no DL");
+      uiPrintLines("Uplink OK", dlLen?"DL":"no DL");
       last_sent_lat_i32 = last_lat_i32; last_sent_lon_i32 = last_lon_i32; last_sent_alt_u16 = last_alt_u16; last_sent_valid = true;
       last_uplink_epoch = millis()/1000;
       digitalWrite(LED_BUILTIN, HIGH); delay(80); digitalWrite(LED_BUILTIN, LOW);
@@ -444,7 +427,7 @@ void setup() {
       Serial.printf("Uplink error %d\n", st);
       {
         String s = String(st);
-  uiPrintLines("Uplink ERR", s.c_str());
+        uiPrintLines("Uplink ERR", s.c_str());
       }
     }
   }
@@ -453,8 +436,9 @@ void setup() {
   uint32_t dcMs = node ? node->timeUntilUplink() : 0;
   // (b) Fixes Wake-Intervall: Ignoriere Verlängerung durch timeUntilUplink
   uint32_t sleepSec = WAKE_INTERVAL_SECONDS;
-  Serial.printf("DEBUG: timeUntilUplink=%lu ms, using fixed sleep=%u s (simulatedPos=%d)\n", (unsigned long)dcMs, (unsigned)sleepSec, simulatedPos?1:0);
+  Serial.printf("DEBUG: timeUntilUplink=%lu ms, using fixed sleep=%u s\n", (unsigned long)dcMs, (unsigned)sleepSec);
   if (!g_debugHold) {
+  Serial.printf("[RTC] Pre-sleep: wake_counter=%lu boot_logo_shown=%d node_activated=%d\n", (unsigned long)wake_counter, boot_logo_shown?1:0, node->isActivated()?1:0);
     deepSleepSeconds(sleepSec);
   } else {
     Serial.printf("Bleibe wach (Sleep wäre %u s)\n", (unsigned)sleepSec);
@@ -467,8 +451,4 @@ void setup() {
   }
 }
 
-void loop() { /* NOP - wir arbeiten nur im setup nach Wake */ }
-
-// (OLED) I2C Scan entfernt – Bootlogo ersetzt Testpattern
-
-
+void loop() {  }
