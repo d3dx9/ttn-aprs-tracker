@@ -9,6 +9,7 @@
 #include "board.h"
 #include "logging.h"
 
+#define LOG_LORAWAN_KEYS 1
 #if HAS_TFT
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
