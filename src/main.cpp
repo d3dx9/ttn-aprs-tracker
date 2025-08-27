@@ -257,6 +257,35 @@ void setup() {
   } else {
     Serial.println("[LWN] Already provisioned");
   }
+
+  #ifdef LOG_LORAWAN_KEYS
+    // Hilfsfunktion zum Hex-Dump mit optionaler Maskierung
+    auto dumpKey = [](const uint8_t* k, const char* name) {
+      char buf[3*16+1]; buf[0]='\0';
+      for (int i=0;i<16;i++) {
+  #ifdef LOG_LORAWAN_KEYS_FULL
+        sprintf(buf + i*3, "%02X ", k[i]);
+  #else
+        // Maskiere mittlere Bytes (nur erste 3 und letzte 2 sichtbar)
+        if (i<3 || i>=14) sprintf(buf + i*3, "%02X ", k[i]); else sprintf(buf + i*3, "** ");
+  #endif
+      }
+      Serial.printf("[LWN] %s: %s\n", name, buf);
+    };
+    // Join/Dev EUI ausgeben
+    auto dumpEUI = [](uint64_t eui, const char* name) {
+      char line[40];
+      sprintf(line, "%s: %016llX", name, (unsigned long long)eui);
+      Serial.print("[LWN] "); Serial.println(line);
+    };
+    dumpEUI(JOIN_EUI, "JOIN_EUI");
+    dumpEUI(DEV_EUI,  "DEV_EUI");
+    dumpKey(APP_KEY, "APP_KEY");
+    dumpKey(NWK_KEY, "NWK_KEY");
+  #ifndef LOG_LORAWAN_KEYS_FULL
+    Serial.println("[LWN] (Zwischen-Bytes mit ** maskiert. LOG_LORAWAN_KEYS_FULL für kompletten Dump setzen.)");
+  #endif
+  #endif // LOG_LORAWAN_KEYS
   node = persist.manage(&radio, false); // false = nicht automatisch joinen (wir steuern unten)
   if (!node) {
     uiPrintLines("Node alloc FAIL");
