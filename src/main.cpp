@@ -10,6 +10,9 @@
 #include "logging.h"
 
 #define LOG_LORAWAN_KEYS 1
+#define CHECK_PROVISIONING_MISMATCH 1
+#define DAUTO_REPROVISION_ON_MISMATCH 1
+
 #if HAS_TFT
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
@@ -249,6 +252,10 @@ void setup() {
   uiPrintLines("Radio OK", "Session load...");
 
   // Provision falls nötig und manage() für automatisches Laden/Join
+#ifdef FORCE_REPROVISION
+  Serial.println("[LWN] FORCE_REPROVISION set -> wiping existing provisioning");
+  persist.wipe();
+#endif
   bool prov = persist.isProvisioned();
   if (!prov) {
     Serial.println("[LWN] Not provisioned -> provisioning from constants");
@@ -258,6 +265,30 @@ void setup() {
   } else {
     Serial.println("[LWN] Already provisioned");
   }
+
+#ifdef CHECK_PROVISIONING_MISMATCH
+  if (prov) {
+    bool mismatch = false;
+    if (persist.getJoinEUI() != JOIN_EUI) mismatch = true;
+    if (persist.getDevEUI()  != DEV_EUI)  mismatch = true;
+    if (memcmp(persist.getAppKey(), APP_KEY, 16) != 0) mismatch = true;
+    if (memcmp(persist.getNwkKey(), NWK_KEY, 16) != 0) mismatch = true;
+    if (mismatch) {
+      Serial.println("[LWN] Provisioned data differs from compiled lorawan_keys.* constants");
+#ifdef AUTO_REPROVISION_ON_MISMATCH
+      Serial.println("[LWN] AUTO_REPROVISION_ON_MISMATCH -> wiping + reprovisioning with constants");
+      persist.wipe();
+      bool pOK2 = persist.provision("EU868", 0, JOIN_EUI, DEV_EUI, APP_KEY, NWK_KEY);
+      Serial.printf("[LWN] reprovision result=%d\n", pOK2?1:0);
+      prov = pOK2;
+#else
+      Serial.println("[LWN] (Define AUTO_REPROVISION_ON_MISMATCH to overwrite stored provisioning automatically.)");
+#endif
+    } else {
+      Serial.println("[LWN] Provisioned data matches compiled constants");
+    }
+  }
+#endif // CHECK_PROVISIONING_MISMATCH
 
   #ifdef LOG_LORAWAN_KEYS
     // Hilfsfunktion zum Hex-Dump mit optionaler Maskierung
